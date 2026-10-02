@@ -7,16 +7,21 @@ three independently callable implementations:
 - `histogram_private`: one padded private table per OpenMP worker, followed by
   a barrier and parallel merging of contiguous output blocks. Private storage
   has a 64 MiB budget by limiting workers (a direct call permits at least one row).
-- `histogram_atomic`: a shared output table with OpenMP `atomic update relaxed`
-  for every increment. The parallel-region barrier completes all updates before
-  returning. No per-element mutex or stronger ordering is needed.
+- `histogram_atomic`: each worker aggregates counts in a fixed-size private hash
+  table (1024 slots, at most 512 distinct values, about 12 KiB on a 64-bit host).
+  Existing values keep accumulating locally. When a new value arrives at capacity,
+  occupied entries are merged into the shared output with OpenMP
+  `atomic update relaxed`, then cleared. Each worker also flushes its final partial
+  batch. The parallel-region barrier completes all updates before returning.
+  This reduces atomic operations for repeated values without allocating M private
+  counters per worker. Uniform input may pay extra hashing cost with little aggregation.
 
 The dispatcher currently uses serial counting for N <= 32768 or a one-thread
 configuration; otherwise it uses private tables for M <= 32768 and atomic
 updates for larger M. These are initial policy constants in `src/histogram.cpp`,
-not benchmark-tuned crossover points. Large-M hotspot inputs can still contend
-heavily on the atomic path; this routing does not promise the fastest solution
-for every distribution.
+not benchmark-tuned crossover points. Hotspot sets larger than the small table can
+still cause frequent flushes and contention; this routing does not promise the
+fastest solution for every distribution. No distribution detection is performed.
 
 All implementations return an empty vector for M <= 0. Otherwise callers must
 provide N >= 0, at least N input elements, and values in [0, M). Only the first

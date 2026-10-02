@@ -53,5 +53,38 @@ int main() {
             }
         }
     }
+
+    // Exercise partial/exact/full batches, hits at capacity, insertion after a
+    // flush, repeated reuse, and hash probing with both dense and strided keys.
+    omp_set_dynamic(0);
+    for (int threads : {1, 3, 8}) {
+        omp_set_num_threads(threads);
+        for (int distinct : {511, 512, 513, 1025}) {
+            for (int step : {1, 1024}) {
+                const int M = (distinct + 1) * step;
+                std::vector<int> in;
+                for (int repeat = 0; repeat < 32; ++repeat) {
+                    for (int value = 0; value < distinct; ++value)
+                        in.push_back(value * step);
+                    for (int hit = 0; hit < 64; ++hit) {
+                        in.push_back(0);
+                        in.push_back((distinct - 1) * step);
+                    }
+                    in.push_back(distinct * step);
+                }
+                const int N = static_cast<int>(in.size());
+                in.push_back(-1); // The final partial batch must not read past N.
+                const auto expected = histogram_baseline(N, M, in);
+                for (Fn fn : {histogram_atomic, histogram}) {
+                    if (fn(N, M, in) != expected) {
+                        std::cerr << "Batch boundary test failed: distinct=" << distinct
+                                  << " step=" << step << " threads=" << threads << '\n';
+                        return 1;
+                    }
+                    ++checks;
+                }
+            }
+        }
+    }
     std::cout << "Passed " << checks << " comparisons across all three implementations and dispatch.\n";
 }
