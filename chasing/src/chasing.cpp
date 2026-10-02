@@ -7,39 +7,75 @@
 namespace chase {
 namespace {
 
-// Advance four independent chains together to overlap their memory accesses.
+constexpr index_t kInterleave = 16;
+constexpr index_t kMaxThreads = 8;
+
+// Advance sixteen chains by their common remaining steps, then refill finished slots.
 void chase_range(const Problem& problem, index_t* final_pos,
                  index_t begin, index_t end) {
-    const index_t* table = problem.table;
-    index_t c = begin;
-    for (; end - c >= 4; c += 4) {
-        index_t p0 = problem.starts[c];
-        index_t p1 = problem.starts[c + 1];
-        index_t p2 = problem.starts[c + 2];
-        index_t p3 = problem.starts[c + 3];
-        index_t s0 = problem.steps[c];
-        index_t s1 = problem.steps[c + 1];
-        index_t s2 = problem.steps[c + 2];
-        index_t s3 = problem.steps[c + 3];
-
-        while (s0 || s1 || s2 || s3) {
-            if (s0) { p0 = table[p0]; --s0; }
-            if (s1) { p1 = table[p1]; --s1; }
-            if (s2) { p2 = table[p2]; --s2; }
-            if (s3) { p3 = table[p3]; --s3; }
+    struct Slot {
+        index_t chain;
+        index_t pos;
+        index_t remaining;
+    };
+    Slot slots[kInterleave];
+    index_t next = begin;
+    unsigned active = 0;
+    for (auto& slot : slots) {
+        slot = {end, 0, 0};
+        if (next < end) {
+            slot = {next, problem.starts[next], problem.steps[next]};
+            ++next;
+            ++active;
         }
-        final_pos[c] = p0;
-        final_pos[c + 1] = p1;
-        final_pos[c + 2] = p2;
-        final_pos[c + 3] = p3;
     }
 
-    // Handle the remaining one to three chains.
-    for (; c < end; ++c) {
-        index_t pos = problem.starts[c];
-        for (index_t remaining = problem.steps[c]; remaining != 0; --remaining)
-            pos = table[pos];
-        final_pos[c] = pos;
+    const index_t* table = problem.table;
+    while (active == kInterleave) {
+        const index_t common = std::min({
+            slots[0].remaining, slots[1].remaining, slots[2].remaining, slots[3].remaining,
+            slots[4].remaining, slots[5].remaining, slots[6].remaining, slots[7].remaining,
+            slots[8].remaining, slots[9].remaining, slots[10].remaining, slots[11].remaining,
+            slots[12].remaining, slots[13].remaining, slots[14].remaining, slots[15].remaining});
+        for (index_t step = 0; step < common; ++step) {
+            slots[0].pos = table[slots[0].pos];
+            slots[1].pos = table[slots[1].pos];
+            slots[2].pos = table[slots[2].pos];
+            slots[3].pos = table[slots[3].pos];
+            slots[4].pos = table[slots[4].pos];
+            slots[5].pos = table[slots[5].pos];
+            slots[6].pos = table[slots[6].pos];
+            slots[7].pos = table[slots[7].pos];
+            slots[8].pos = table[slots[8].pos];
+            slots[9].pos = table[slots[9].pos];
+            slots[10].pos = table[slots[10].pos];
+            slots[11].pos = table[slots[11].pos];
+            slots[12].pos = table[slots[12].pos];
+            slots[13].pos = table[slots[13].pos];
+            slots[14].pos = table[slots[14].pos];
+            slots[15].pos = table[slots[15].pos];
+        }
+
+        for (auto& slot : slots) {
+            slot.remaining -= common;
+            if (slot.remaining != 0) continue;
+            final_pos[slot.chain] = slot.pos;
+            if (next < end) {
+                slot = {next, problem.starts[next], problem.steps[next]};
+                ++next;
+            } else {
+                slot.chain = end;
+                --active;
+            }
+        }
+    }
+
+    // Once input is exhausted, finish the remaining occupied slots.
+    for (auto& slot : slots) {
+        if (slot.chain == end) continue;
+        for (; slot.remaining != 0; --slot.remaining)
+            slot.pos = table[slot.pos];
+        final_pos[slot.chain] = slot.pos;
     }
 }
 
@@ -48,8 +84,8 @@ void chase_range(const Problem& problem, index_t* final_pos,
 void chase(const Problem& problem, index_t* final_pos) {
     const index_t count = problem.chain_count;
     if (count == 0) return;
-    const unsigned available = std::max(1u, std::thread::hardware_concurrency());
-    const index_t threads = std::min<index_t>(available, std::max<index_t>(1, count / 4));
+    const index_t threads = std::min(kMaxThreads,
+        std::max<index_t>(1, count / kInterleave));
     if (threads == 1) {
         chase_range(problem, final_pos, 0, count);
         return;
