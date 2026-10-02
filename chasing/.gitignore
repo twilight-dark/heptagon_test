@@ -1,0 +1,4 @@
+*.o
+*.bin
+CLAUDE.md
+cpu_pointer_chasing*

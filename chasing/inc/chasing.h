@@ -1,0 +1,6 @@
+#ifndef CPU_POINTER_CHASING_CHASING_H_
+#define CPU_POINTER_CHASING_CHASING_H_
+
+#include "utility.h"
+
+#endif  // CPU_POINTER_CHASING_CHASING_H_
