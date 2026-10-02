@@ -1,7 +1,7 @@
 # Histogram implementations
 
-`src/histogram.h` exposes the existing `histogram(N, M, in)` entry point and
-three independently callable implementations:
+`src/histogram.cpp` contains the existing `histogram(N, M, in)` entry point and
+three implementations, without a project header dependency:
 
 - `histogram_serial`: sequential counting.
 - `histogram_private`: one padded private table per OpenMP worker, followed by
@@ -28,7 +28,5 @@ provide N >= 0, at least N input elements, and values in [0, M). Only the first
 N elements are counted. N = 0 returns M zeros.
 
 Build and run the original benchmark with `make` and
-`OMP_NUM_THREADS=8 ./histogram_bench`. Run correctness checks with `make test`.
-The tests compare every implementation and the dispatcher with the baseline,
-including empty inputs, partial input ranges, uneven thread partitions,
-dispatch boundaries, different distributions and dynamic OpenMP teams.
+`OMP_NUM_THREADS=8 ./histogram_bench`. The benchmark compares the dispatcher
+with the original serial baseline across its 12 cases.

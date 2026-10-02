@@ -1,10 +1,9 @@
-#include "histogram.h"
-
 #include <algorithm>
 #include <array>
 #include <cstddef>
 #include <cstdint>
 #include <memory>
+#include <vector>
 #include <omp.h>
 
 namespace {
