@@ -12,7 +12,6 @@ constexpr int kSerialMaxN = 32768;
 constexpr int kPrivateMaxM = 32768;
 constexpr std::size_t kPrivateBudget = 64 * 1024 * 1024;
 constexpr std::size_t kCacheLineInts = 64 / sizeof(int);
-constexpr int kMergeBlock = 4096;
 
 // Keep the linear-probing table at most half full to bound typical lookup cost.
 constexpr std::size_t kAtomicSlots = 1024;
@@ -124,17 +123,19 @@ std::vector<int> histogram_private(int N, int M, const std::vector<int>& in) {
         for (int i = 0; i < N; ++i) ++row[in[i]];
         // The preceding implicit barrier is required before reading other rows.
 
-        #pragma omp for schedule(static)
-        for (std::size_t begin = 0; begin < static_cast<std::size_t>(M);
-             begin += kMergeBlock) {
-            const std::size_t end = std::min(
-                begin + kMergeBlock, static_cast<std::size_t>(M));
-            for (int t = 0; t < actual_threads; ++t) {
-                const int* source = local.get() + static_cast<std::size_t>(t) * stride;
-                for (std::size_t bin = begin; bin < end; ++bin)
-                    out[bin] += source[bin];
-            }
+        // Each worker owns a contiguous output range. The first r workers
+        // receive one extra bin; M < actual_threads permits empty ranges.
+        const std::size_t bins = static_cast<std::size_t>(M);
+        const std::size_t q = bins / actual_threads;
+        const std::size_t r = bins % actual_threads;
+        const std::size_t begin = tid * q + std::min<std::size_t>(tid, r);
+        const std::size_t end = begin + q + (static_cast<std::size_t>(tid) < r);
+        for (int t = 0; t < actual_threads; ++t) {
+            const int* source = local.get() + static_cast<std::size_t>(t) * stride;
+            for (std::size_t bin = begin; bin < end; ++bin)
+                out[bin] += source[bin];
         }
+        // The parallel-region barrier completes all output ranges.
     }
     return out;
 }
