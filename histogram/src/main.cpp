@@ -7,7 +7,8 @@
 #include <string>
 #include <vector>
 
-#include "histogram.h"
+// 选手实现
+std::vector<int> histogram(int N, int M, const std::vector<int>& in);
 // 发布的基线
 std::vector<int> histogram_baseline(int N, int M,
                                     const std::vector<int>& in);

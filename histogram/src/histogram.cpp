@@ -1,8 +1,9 @@
-#include "histogram.h"
-
 #include <algorithm>
+#include <array>
 #include <cstddef>
+#include <cstdint>
 #include <memory>
+#include <vector>
 #include <omp.h>
 
 namespace {
@@ -12,6 +13,62 @@ constexpr int kPrivateMaxM = 32768;
 constexpr std::size_t kPrivateBudget = 64 * 1024 * 1024;
 constexpr std::size_t kCacheLineInts = 64 / sizeof(int);
 constexpr int kMergeBlock = 4096;
+
+// Keep the linear-probing table at most half full to bound typical lookup cost.
+constexpr std::size_t kAtomicSlots = 1024;
+constexpr std::size_t kAtomicCapacity = kAtomicSlots / 2;
+static_assert((kAtomicSlots & (kAtomicSlots - 1)) == 0);
+
+class AtomicBatch {
+public:
+    void add(int value, int* out) {
+        std::size_t slot = hash(value);
+        while (entries_[slot].count != 0) {
+            if (entries_[slot].value == value) {
+                ++entries_[slot].count;
+                return;
+            }
+            slot = (slot + 1) & (kAtomicSlots - 1);
+        }
+        // Hits in a full batch remain local. Flush only for a new distinct value.
+        if (used_ == kAtomicCapacity) {
+            flush(out);
+            slot = hash(value);
+        }
+        entries_[slot] = {value, 1};
+        touched_[used_++] = slot;
+    }
+
+    void flush(int* out) {
+        for (std::size_t i = 0; i < used_; ++i) {
+            Entry& entry = entries_[touched_[i]];
+            const int value = entry.value;
+            const int count = entry.count;
+            #pragma omp atomic update relaxed
+            out[value] += count;
+            entry.count = 0;
+        }
+        used_ = 0;
+    }
+
+private:
+    static std::size_t hash(int value) {
+        // Mix high bits too, so strided input does not all map to one slot.
+        std::uint32_t mixed = static_cast<std::uint32_t>(value);
+        mixed ^= mixed >> 16;
+        mixed *= 0x7feb352dU;
+        mixed ^= mixed >> 15;
+        return mixed & (kAtomicSlots - 1);
+    }
+
+    struct Entry {
+        int value;
+        int count;
+    };
+    std::array<Entry, kAtomicSlots> entries_{};
+    std::array<std::size_t, kAtomicCapacity> touched_;
+    std::size_t used_ = 0;
+};
 
 std::size_t private_stride(int M) {
     // A full padding line separates rows even if the allocation is unaligned.
@@ -31,12 +88,14 @@ std::vector<int> histogram_atomic(int N, int M, const std::vector<int>& in) {
     std::vector<int> out(static_cast<std::size_t>(M), 0);
     if (N <= 0) return out;
     const int threads = std::min(N, omp_get_max_threads());
-    #pragma omp parallel for num_threads(threads) schedule(static)
-    for (int i = 0; i < N; ++i) {
-        // Only indivisible increments are needed; the implicit barrier makes
-        // all updates complete before the result is returned.
-        #pragma omp atomic update relaxed
-        ++out[in[i]];
+    #pragma omp parallel num_threads(threads)
+    {
+        AtomicBatch batch;
+        #pragma omp for schedule(static) nowait
+        for (int i = 0; i < N; ++i) batch.add(in[i], out.data());
+        batch.flush(out.data());
+        // All shared updates are atomic, including final partial batches.
+        // The parallel-region barrier completes them before returning.
     }
     return out;
 }
