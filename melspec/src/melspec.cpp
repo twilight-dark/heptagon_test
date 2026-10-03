@@ -105,6 +105,29 @@ std::vector<std::vector<double>> build_mel_filterbank(int sr, int n_fft,
     return weights;
 }
 
+namespace {
+struct MelBand {
+    int first;
+    std::vector<double> weights;
+};
+
+std::vector<MelBand> sparse_filterbank(int sr, int n_fft, int n_mels,
+                                      double f_min, double f_max) {
+    const auto dense = build_mel_filterbank(sr, n_fft, n_mels, f_min, f_max);
+    std::vector<MelBand> bands;
+    bands.reserve(n_mels);
+    for (const auto& weights : dense) {
+        int first = 0;
+        int end = static_cast<int>(weights.size());
+        while (first < end && weights[first] == 0.0) ++first;
+        while (end > first && weights[end - 1] == 0.0) --end;
+        bands.push_back({first, std::vector<double>(weights.begin() + first,
+                                                   weights.begin() + end)});
+    }
+    return bands;
+}
+}  // namespace
+
 // ─────────────────────────────────────────────────────────────────────────────
 // Mel spectrogram computation
 // ─────────────────────────────────────────────────────────────────────────────
@@ -149,15 +172,16 @@ void compute_melspectrogram(const std::vector<double>& y, int sr, int n_fft,
     }
 
     // Build mel filterbank: mel_fb[m][k]
-    auto mel_fb = build_mel_filterbank(sr, n_fft, n_mels, f_min, f_max);
+    const auto mel_fb = sparse_filterbank(sr, n_fft, n_mels, f_min, f_max);
 
     // Apply filterbank: output[m][t] = sum_k mel_fb[m][k] * power_spec[k][t]
     output.resize(static_cast<size_t>(n_mels) * n_frames);
     for (int m = 0; m < n_mels; ++m) {
         for (int t = 0; t < n_frames; ++t) {
             double acc = 0.0;
-            for (int k = 0; k < n_bins; ++k)
-                acc += mel_fb[m][k] * power_spec[k][t];
+            const auto& band = mel_fb[m];
+            for (std::size_t k = 0; k < band.weights.size(); ++k)
+                acc += band.weights[k] * power_spec[band.first + k][t];
             output[m * n_frames + t] = acc;
         }
     }
