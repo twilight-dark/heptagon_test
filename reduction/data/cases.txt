@@ -1,0 +1,10 @@
+# Each non-comment line is an input length N. N need not be a power of two,
+# a multiple of a warp size, or a multiple of a block size.
+1
+31
+257
+1000
+1025
+65537
+1048579
+16777219
