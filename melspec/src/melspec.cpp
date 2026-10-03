@@ -68,20 +68,54 @@ void fft_inplace(std::vector<std::complex<double>>& a, const FftPlan& plan) {
         len *= 2;
     }
 }
+struct RealFftPlan {
+    int n;
+    FftPlan packed_plan;
+    std::vector<std::complex<double>> recovery;
+
+    explicit RealFftPlan(int length)
+        : n(length), packed_plan(length > 1 ? length / 2 : 1) {
+        if (n <= 0 || (n & (n - 1)) != 0)
+            throw std::invalid_argument("FFT length must be a positive power of two");
+        recovery.resize(n / 2 + 1);
+        for (int k = 0; k <= n / 2; ++k) {
+            const double angle = -2.0 * M_PI * k / n;
+            recovery[k] = {std::cos(angle), std::sin(angle)};
+        }
+    }
+};
+
+std::complex<double> real_bin(const std::vector<std::complex<double>>& packed,
+                              const RealFftPlan& plan, int k) {
+    if (plan.n == 1) return {packed[0].real(), 0.0};
+    if (k == 0) return {packed[0].real() + packed[0].imag(), 0.0};
+    if (k == plan.n / 2)
+        return {packed[0].real() - packed[0].imag(), 0.0};
+    const auto a = packed[k];
+    const auto b = std::conj(packed[plan.n / 2 - k]);
+    const auto sum = a + b;
+    const auto difference = (a - b) * plan.recovery[k];
+    // X[k] = ((a+b) - i*W[k]*(a-b)) / 2.
+    return {0.5 * (sum.real() + difference.imag()),
+            0.5 * (sum.imag() - difference.real())};
+}
 }  // namespace
 
-// Real FFT: input n real values → output n/2+1 complex values.
+// Pack even/odd real samples into a half-length complex FFT.
 void compute_rfft(const std::vector<double>& frame,
                   std::vector<std::complex<double>>& out) {
     const int n = static_cast<int>(frame.size());
-    // Copy real input into complex array
-    std::vector<std::complex<double>> a(n);
-    for (int i = 0; i < n; ++i) a[i] = {frame[i], 0.0};
-    const FftPlan plan(n);
-    fft_inplace(a, plan);
-    // Keep only DC + positive frequencies (n/2+1 bins)
+    const RealFftPlan plan(n);
+    std::vector<std::complex<double>> packed(std::max(1, n / 2));
+    if (n == 1) {
+        packed[0] = {frame[0], 0.0};
+    } else {
+        for (int i = 0; i < n / 2; ++i)
+            packed[i] = {frame[2 * i], frame[2 * i + 1]};
+    }
+    fft_inplace(packed, plan.packed_plan);
     out.resize(n / 2 + 1);
-    for (int k = 0; k <= n / 2; ++k) out[k] = a[k];
+    for (int k = 0; k <= n / 2; ++k) out[k] = real_bin(packed, plan, k);
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -170,14 +204,14 @@ void compute_melspectrogram(const std::vector<double>& y, int sr, int n_fft,
             0.5 * (1.0 - std::cos(2.0 * M_PI * i / static_cast<double>(n_fft)));
 
     const auto mel_fb = sparse_filterbank(sr, n_fft, n_mels, f_min, f_max);
-    const FftPlan fft_plan(n_fft);
+    const RealFftPlan fft_plan(n_fft);
     output.resize(static_cast<std::size_t>(n_mels) * n_frames);
     const unsigned int available = std::max(1u, std::thread::hardware_concurrency());
     const int workers = std::min({16, static_cast<int>(std::min(available, 16u)),
                                   1 + (n_frames - 1) / 64});
     // Allocate all thread-private buffers before launching any worker.
     std::vector<std::vector<std::complex<double>>> fft_buffers(
-        workers, std::vector<std::complex<double>>(n_fft));
+        workers, std::vector<std::complex<double>>(std::max(1, n_fft / 2)));
     std::vector<std::vector<double>> power_buffers(
         workers, std::vector<double>(n_bins));
 
@@ -188,14 +222,18 @@ void compute_melspectrogram(const std::vector<double>& y, int sr, int n_fft,
         const int end = static_cast<long long>(n_frames) * (worker + 1) / workers;
         for (int t = first; t < end; ++t) {
             const std::size_t start = static_cast<std::size_t>(t) * hop_length;
-            for (int i = 0; i < n_fft; ++i)
-                fft_data[i] = {y[start + i] * window[i], 0.0};
-            fft_inplace(fft_data, fft_plan);
+            if (n_fft == 1) {
+                fft_data[0] = {y[start] * window[0], 0.0};
+            } else {
+                for (int i = 0; i < n_fft / 2; ++i)
+                    fft_data[i] = {y[start + 2 * i] * window[2 * i],
+                                   y[start + 2 * i + 1] * window[2 * i + 1]};
+            }
+            fft_inplace(fft_data, fft_plan.packed_plan);
 
             for (int k = 0; k < n_bins; ++k) {
-                const double re = fft_data[k].real();
-                const double im = fft_data[k].imag();
-                power[k] = re * re + im * im;
+                const auto value = real_bin(fft_data, fft_plan, k);
+                power[k] = value.real() * value.real() + value.imag() * value.imag();
             }
 
             for (int m = 0; m < n_mels; ++m) {
