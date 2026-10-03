@@ -1,0 +1,16 @@
+#one line a integer indicated the size of matrix N x N
+#ensure the N must be a multiple of 32
+
+# small cases
+512
+544
+
+#medium cases
+1024
+1056
+1088
+
+#large cases
+4096
+6144
+8192
