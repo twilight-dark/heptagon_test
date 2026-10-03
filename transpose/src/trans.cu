@@ -4,7 +4,7 @@
 
 namespace {
 constexpr int kTile = 32;
-constexpr int kBlockRows = 8;
+constexpr int kBlockRows = 16;
 
 __global__ void transpose_and_mix(int N, const double *__restrict__ A,
                                   double *__restrict__ B) {
