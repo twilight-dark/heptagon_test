@@ -9,6 +9,10 @@
 #include <thread>
 #include <vector>
 
+#if defined(__x86_64__) || defined(__i386__)
+#include <immintrin.h>
+#endif
+
 // ─────────────────────────────────────────────────────────────────────────────
 // HTK mel scale
 // ─────────────────────────────────────────────────────────────────────────────
@@ -27,12 +31,16 @@ double mel_to_hz(double m) {
 
 namespace {
 struct FftPlan {
+    bool vectorized = false;
     std::vector<int> reverse;
     std::vector<std::complex<double>> twiddles;
 
     explicit FftPlan(int n) {
         if (n <= 0 || (n & (n - 1)) != 0)
             throw std::invalid_argument("FFT length must be a positive power of two");
+#if defined(__x86_64__) || defined(__i386__)
+        vectorized = __builtin_cpu_supports("avx2");
+#endif
         reverse.resize(n);
         for (int i = 1; i < n; ++i)
             reverse[i] = (reverse[i >> 1] >> 1) | ((i & 1) ? n >> 1 : 0);
@@ -49,17 +57,38 @@ struct FftPlan {
     }
 };
 
-void fft_inplace(std::vector<std::complex<double>>& a, const FftPlan& plan) {
-    const int n = static_cast<int>(a.size());
-    for (int i = 0; i < n; ++i)
-        if (i < plan.reverse[i]) std::swap(a[i], a[plan.reverse[i]]);
-    for (int len = 2; len <= n;) {
+// Combine the first two radix-2 stages into four-point butterflies.
+// The only nontrivial rotation is -i, implemented without multiplication.
+void first_stages(std::complex<double>* a, int n) {
+    if (n == 2) {
+        const auto u = a[0];
+        a[0] = u + a[1];
+        a[1] = u - a[1];
+    }
+    for (int i = 0; i + 3 < n; i += 4) {
+        const auto u0 = a[i] + a[i + 1];
+        const auto u1 = a[i] - a[i + 1];
+        const auto v0 = a[i + 2] + a[i + 3];
+        const auto difference = a[i + 2] - a[i + 3];
+        const std::complex<double> v1(difference.imag(), -difference.real());
+        a[i] = u0 + v0;
+        a[i + 1] = u1 + v1;
+        a[i + 2] = u0 - v0;
+        a[i + 3] = u1 - v1;
+    }
+}
+
+void butterflies_scalar(std::complex<double>* a, int n, const FftPlan& plan) {
+    for (int len = 8; len <= n;) {
         const int half = len / 2;
         const auto* weights = plan.twiddles.data() + half - 1;
         for (int i = 0; i < n; i += len) {
             for (int j = 0; j < half; ++j) {
                 const auto u = a[i + j];
-                const auto v = a[i + j + half] * weights[j];
+                const auto b = a[i + j + half];
+                const auto w = weights[j];
+                const std::complex<double> v(b.real() * w.real() - b.imag() * w.imag(),
+                                             b.real() * w.imag() + b.imag() * w.real());
                 a[i + j] = u + v;
                 a[i + j + half] = u - v;
             }
@@ -68,6 +97,50 @@ void fft_inplace(std::vector<std::complex<double>>& a, const FftPlan& plan) {
         len *= 2;
     }
 }
+
+#if defined(__x86_64__) || defined(__i386__)
+__attribute__((target("avx2")))
+void butterflies_avx2(std::complex<double>* a, int n, const FftPlan& plan) {
+    // std::complex<double> exposes interleaved real/imaginary double storage.
+    auto* data = reinterpret_cast<double*>(a);
+    for (int len = 8; len <= n;) {
+        const int half = len / 2;
+        const auto* weights = reinterpret_cast<const double*>(
+            plan.twiddles.data() + half - 1);
+        for (int i = 0; i < n; i += len) {
+            for (int j = 0; j < half; j += 2) {
+                const __m256d u = _mm256_loadu_pd(data + 2 * (i + j));
+                const __m256d b = _mm256_loadu_pd(data + 2 * (i + j + half));
+                const __m256d w = _mm256_loadu_pd(weights + 2 * j);
+                const __m256d wr = _mm256_movedup_pd(w);
+                const __m256d wi = _mm256_permute_pd(w, 0xf);
+                const __m256d swapped = _mm256_permute_pd(b, 0x5);
+                const __m256d v = _mm256_addsub_pd(_mm256_mul_pd(b, wr),
+                                                   _mm256_mul_pd(swapped, wi));
+                _mm256_storeu_pd(data + 2 * (i + j), _mm256_add_pd(u, v));
+                _mm256_storeu_pd(data + 2 * (i + j + half), _mm256_sub_pd(u, v));
+            }
+        }
+        if (len == n) break;
+        len *= 2;
+    }
+}
+#endif
+
+void fft_inplace(std::vector<std::complex<double>>& a, const FftPlan& plan) {
+    const int n = static_cast<int>(a.size());
+    for (int i = 0; i < n; ++i)
+        if (i < plan.reverse[i]) std::swap(a[i], a[plan.reverse[i]]);
+    first_stages(a.data(), n);
+#if defined(__x86_64__) || defined(__i386__)
+    if (plan.vectorized) {
+        butterflies_avx2(a.data(), n, plan);
+        return;
+    }
+#endif
+    butterflies_scalar(a.data(), n, plan);
+}
+
 struct RealFftPlan {
     int n;
     FftPlan packed_plan;
@@ -181,6 +254,28 @@ std::vector<MelBand> sparse_filterbank(int sr, int n_fft, int n_mels,
     }
     return bands;
 }
+double dot_scalar(const double* weights, const double* power, std::size_t count) {
+    double sum = 0.0;
+    for (std::size_t k = 0; k < count; ++k) sum += weights[k] * power[k];
+    return sum;
+}
+
+#if defined(__x86_64__) || defined(__i386__)
+__attribute__((target("avx2")))
+double dot_avx2(const double* weights, const double* power, std::size_t count) {
+    __m256d sum = _mm256_setzero_pd();
+    std::size_t k = 0;
+    for (; k + 4 <= count; k += 4) {
+        sum = _mm256_add_pd(sum, _mm256_mul_pd(_mm256_loadu_pd(weights + k),
+                                              _mm256_loadu_pd(power + k)));
+    }
+    const __m128d pair = _mm_add_pd(_mm256_castpd256_pd128(sum),
+                                   _mm256_extractf128_pd(sum, 1));
+    double result = _mm_cvtsd_f64(_mm_add_sd(pair, _mm_unpackhi_pd(pair, pair)));
+    for (; k < count; ++k) result += weights[k] * power[k];
+    return result;
+}
+#endif
 }  // namespace
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -205,6 +300,10 @@ void compute_melspectrogram(const std::vector<double>& y, int sr, int n_fft,
 
     const auto mel_fb = sparse_filterbank(sr, n_fft, n_mels, f_min, f_max);
     const RealFftPlan fft_plan(n_fft);
+    auto dot = &dot_scalar;
+#if defined(__x86_64__) || defined(__i386__)
+    if (fft_plan.packed_plan.vectorized) dot = &dot_avx2;
+#endif
     output.resize(static_cast<std::size_t>(n_mels) * n_frames);
     const unsigned int available = std::max(1u, std::thread::hardware_concurrency());
     const int workers = std::min({16, static_cast<int>(std::min(available, 16u)),
@@ -238,9 +337,8 @@ void compute_melspectrogram(const std::vector<double>& y, int sr, int n_fft,
 
             for (int m = 0; m < n_mels; ++m) {
                 const auto& band = mel_fb[m];
-                double acc = 0.0;
-                for (std::size_t k = 0; k < band.weights.size(); ++k)
-                    acc += band.weights[k] * power[band.first + k];
+                const double acc = dot(band.weights.data(), power.data() + band.first,
+                                       band.weights.size());
                 output[static_cast<std::size_t>(m) * n_frames + t] = acc;
             }
         }
