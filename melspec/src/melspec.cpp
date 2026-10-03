@@ -6,6 +6,7 @@
 #include <complex>
 #include <cstring>
 #include <stdexcept>
+#include <thread>
 #include <vector>
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -150,29 +151,51 @@ void compute_melspectrogram(const std::vector<double>& y, int sr, int n_fft,
 
     const auto mel_fb = sparse_filterbank(sr, n_fft, n_mels, f_min, f_max);
     output.resize(static_cast<std::size_t>(n_mels) * n_frames);
-    std::vector<std::complex<double>> fft_data(n_fft);
-    std::vector<double> power(n_bins);
+    const unsigned int available = std::max(1u, std::thread::hardware_concurrency());
+    const int workers = std::min({16, static_cast<int>(std::min(available, 16u)),
+                                  1 + (n_frames - 1) / 64});
+    // Allocate all thread-private buffers before launching any worker.
+    std::vector<std::vector<std::complex<double>>> fft_buffers(
+        workers, std::vector<std::complex<double>>(n_fft));
+    std::vector<std::vector<double>> power_buffers(
+        workers, std::vector<double>(n_bins));
 
-    for (int t = 0; t < n_frames; ++t) {
-        const std::size_t start = static_cast<std::size_t>(t) * hop_length;
-        // Window directly into the reusable FFT workspace.
-        for (int i = 0; i < n_fft; ++i)
-            fft_data[i] = {y[start + i] * window[i], 0.0};
-        fft_inplace(fft_data);
+    const auto process_frames = [&](int worker) {
+        auto& fft_data = fft_buffers[worker];
+        auto& power = power_buffers[worker];
+        const int first = static_cast<long long>(n_frames) * worker / workers;
+        const int end = static_cast<long long>(n_frames) * (worker + 1) / workers;
+        for (int t = first; t < end; ++t) {
+            const std::size_t start = static_cast<std::size_t>(t) * hop_length;
+            for (int i = 0; i < n_fft; ++i)
+                fft_data[i] = {y[start + i] * window[i], 0.0};
+            fft_inplace(fft_data);
 
-        for (int k = 0; k < n_bins; ++k) {
-            const double re = fft_data[k].real();
-            const double im = fft_data[k].imag();
-            power[k] = re * re + im * im;
+            for (int k = 0; k < n_bins; ++k) {
+                const double re = fft_data[k].real();
+                const double im = fft_data[k].imag();
+                power[k] = re * re + im * im;
+            }
+
+            for (int m = 0; m < n_mels; ++m) {
+                const auto& band = mel_fb[m];
+                double acc = 0.0;
+                for (std::size_t k = 0; k < band.weights.size(); ++k)
+                    acc += band.weights[k] * power[band.first + k];
+                output[static_cast<std::size_t>(m) * n_frames + t] = acc;
+            }
         }
+    };
 
-        // Consume the current spectrum while it is still in the local buffer.
-        for (int m = 0; m < n_mels; ++m) {
-            const auto& band = mel_fb[m];
-            double acc = 0.0;
-            for (std::size_t k = 0; k < band.weights.size(); ++k)
-                acc += band.weights[k] * power[band.first + k];
-            output[static_cast<std::size_t>(m) * n_frames + t] = acc;
-        }
+    std::vector<std::thread> threads;
+    threads.reserve(workers - 1);
+    try {
+        for (int worker = 1; worker < workers; ++worker)
+            threads.emplace_back(process_frames, worker);
+    } catch (...) {
+        for (auto& thread : threads) thread.join();
+        throw;
     }
+    process_frames(0);
+    for (auto& thread : threads) thread.join();
 }
