@@ -148,41 +148,31 @@ void compute_melspectrogram(const std::vector<double>& y, int sr, int n_fft,
         window[i] =
             0.5 * (1.0 - std::cos(2.0 * M_PI * i / static_cast<double>(n_fft)));
 
-    // Power spectrum: power_spec[k][t], shape (n_bins, n_frames)
-    std::vector<std::vector<double>> power_spec(n_bins,
-                                                std::vector<double>(n_frames));
+    const auto mel_fb = sparse_filterbank(sr, n_fft, n_mels, f_min, f_max);
+    output.resize(static_cast<std::size_t>(n_mels) * n_frames);
+    std::vector<std::complex<double>> fft_data(n_fft);
+    std::vector<double> power(n_bins);
 
     for (int t = 0; t < n_frames; ++t) {
-        int start = t * hop_length;
+        const std::size_t start = static_cast<std::size_t>(t) * hop_length;
+        // Window directly into the reusable FFT workspace.
+        for (int i = 0; i < n_fft; ++i)
+            fft_data[i] = {y[start + i] * window[i], 0.0};
+        fft_inplace(fft_data);
 
-        // Window the frame
-        std::vector<double> frame(n_fft);
-        for (int i = 0; i < n_fft; ++i) frame[i] = y[start + i] * window[i];
-
-        // FFT
-        std::vector<std::complex<double>> fft_out;
-        compute_rfft(frame, fft_out);
-
-        // |X|^2
         for (int k = 0; k < n_bins; ++k) {
-            double re = fft_out[k].real();
-            double im = fft_out[k].imag();
-            power_spec[k][t] = re * re + im * im;
+            const double re = fft_data[k].real();
+            const double im = fft_data[k].imag();
+            power[k] = re * re + im * im;
         }
-    }
 
-    // Build mel filterbank: mel_fb[m][k]
-    const auto mel_fb = sparse_filterbank(sr, n_fft, n_mels, f_min, f_max);
-
-    // Apply filterbank: output[m][t] = sum_k mel_fb[m][k] * power_spec[k][t]
-    output.resize(static_cast<size_t>(n_mels) * n_frames);
-    for (int m = 0; m < n_mels; ++m) {
-        for (int t = 0; t < n_frames; ++t) {
-            double acc = 0.0;
+        // Consume the current spectrum while it is still in the local buffer.
+        for (int m = 0; m < n_mels; ++m) {
             const auto& band = mel_fb[m];
+            double acc = 0.0;
             for (std::size_t k = 0; k < band.weights.size(); ++k)
-                acc += band.weights[k] * power_spec[band.first + k][t];
-            output[m * n_frames + t] = acc;
+                acc += band.weights[k] * power[band.first + k];
+            output[static_cast<std::size_t>(m) * n_frames + t] = acc;
         }
     }
 }
