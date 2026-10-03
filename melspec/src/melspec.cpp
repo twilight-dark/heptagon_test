@@ -25,31 +25,50 @@ double mel_to_hz(double m) {
 // Cooley-Tukey iterative FFT (in-place, complex input/output)
 // ─────────────────────────────────────────────────────────────────────────────
 
-static void fft_inplace(std::vector<std::complex<double>>& a) {
-    const int n = static_cast<int>(a.size());
-    // Bit-reversal permutation
-    for (int i = 1, j = 0; i < n; ++i) {
-        int bit = n >> 1;
-        for (; j & bit; bit >>= 1) j ^= bit;
-        j ^= bit;
-        if (i < j) std::swap(a[i], a[j]);
-    }
-    // Cooley-Tukey butterfly stages
-    for (int len = 2; len <= n; len <<= 1) {
-        double ang = -2.0 * M_PI / static_cast<double>(len);
-        std::complex<double> wlen(std::cos(ang), std::sin(ang));
-        for (int i = 0; i < n; i += len) {
-            std::complex<double> w(1.0, 0.0);
-            for (int j = 0; j < len / 2; ++j) {
-                std::complex<double> u = a[i + j];
-                std::complex<double> v = a[i + j + len / 2] * w;
-                a[i + j] = u + v;
-                a[i + j + len / 2] = u - v;
-                w *= wlen;
+namespace {
+struct FftPlan {
+    std::vector<int> reverse;
+    std::vector<std::complex<double>> twiddles;
+
+    explicit FftPlan(int n) {
+        if (n <= 0 || (n & (n - 1)) != 0)
+            throw std::invalid_argument("FFT length must be a positive power of two");
+        reverse.resize(n);
+        for (int i = 1; i < n; ++i)
+            reverse[i] = (reverse[i >> 1] >> 1) | ((i & 1) ? n >> 1 : 0);
+        twiddles.resize(n - 1);
+        for (int len = 2; len <= n;) {
+            const int half = len / 2;
+            for (int j = 0; j < half; ++j) {
+                const double angle = -2.0 * M_PI * j / len;
+                twiddles[half - 1 + j] = {std::cos(angle), std::sin(angle)};
             }
+            if (len == n) break;
+            len *= 2;
         }
     }
+};
+
+void fft_inplace(std::vector<std::complex<double>>& a, const FftPlan& plan) {
+    const int n = static_cast<int>(a.size());
+    for (int i = 0; i < n; ++i)
+        if (i < plan.reverse[i]) std::swap(a[i], a[plan.reverse[i]]);
+    for (int len = 2; len <= n;) {
+        const int half = len / 2;
+        const auto* weights = plan.twiddles.data() + half - 1;
+        for (int i = 0; i < n; i += len) {
+            for (int j = 0; j < half; ++j) {
+                const auto u = a[i + j];
+                const auto v = a[i + j + half] * weights[j];
+                a[i + j] = u + v;
+                a[i + j + half] = u - v;
+            }
+        }
+        if (len == n) break;
+        len *= 2;
+    }
 }
+}  // namespace
 
 // Real FFT: input n real values → output n/2+1 complex values.
 void compute_rfft(const std::vector<double>& frame,
@@ -58,7 +77,8 @@ void compute_rfft(const std::vector<double>& frame,
     // Copy real input into complex array
     std::vector<std::complex<double>> a(n);
     for (int i = 0; i < n; ++i) a[i] = {frame[i], 0.0};
-    fft_inplace(a);
+    const FftPlan plan(n);
+    fft_inplace(a, plan);
     // Keep only DC + positive frequencies (n/2+1 bins)
     out.resize(n / 2 + 1);
     for (int k = 0; k <= n / 2; ++k) out[k] = a[k];
@@ -150,6 +170,7 @@ void compute_melspectrogram(const std::vector<double>& y, int sr, int n_fft,
             0.5 * (1.0 - std::cos(2.0 * M_PI * i / static_cast<double>(n_fft)));
 
     const auto mel_fb = sparse_filterbank(sr, n_fft, n_mels, f_min, f_max);
+    const FftPlan fft_plan(n_fft);
     output.resize(static_cast<std::size_t>(n_mels) * n_frames);
     const unsigned int available = std::max(1u, std::thread::hardware_concurrency());
     const int workers = std::min({16, static_cast<int>(std::min(available, 16u)),
@@ -169,7 +190,7 @@ void compute_melspectrogram(const std::vector<double>& y, int sr, int n_fft,
             const std::size_t start = static_cast<std::size_t>(t) * hop_length;
             for (int i = 0; i < n_fft; ++i)
                 fft_data[i] = {y[start + i] * window[i], 0.0};
-            fft_inplace(fft_data);
+            fft_inplace(fft_data, fft_plan);
 
             for (int k = 0; k < n_bins; ++k) {
                 const double re = fft_data[k].real();
