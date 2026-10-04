@@ -360,16 +360,52 @@ struct MelBand {
 
 std::vector<MelBand> sparse_filterbank(int sr, int n_fft, int n_mels,
                                       double f_min, double f_max) {
-    const auto dense = build_mel_filterbank(sr, n_fft, n_mels, f_min, f_max);
+    const int n_bins = n_fft / 2 + 1;
+    std::vector<double> frequencies(n_bins);
+    for (int k = 0; k < n_bins; ++k)
+        frequencies[k] = static_cast<double>(k) * sr / static_cast<double>(n_fft);
+    const double mel_min = hz_to_mel(f_min);
+    const double mel_max = hz_to_mel(f_max);
+    std::vector<double> hz_points(n_mels + 2);
+    for (int i = 0; i <= n_mels + 1; ++i)
+        hz_points[i] = mel_to_hz(mel_min + i * (mel_max - mel_min) / (n_mels + 1));
+
     std::vector<MelBand> bands;
     bands.reserve(n_mels);
-    for (const auto& weights : dense) {
+    for (int m = 0; m < n_mels; ++m) {
+        const double left = hz_points[m];
+        const double center = hz_points[m + 1];
+        const double right = hz_points[m + 2];
+        const double norm = 2.0 / (right - left);
         int first = 0;
-        int end = static_cast<int>(weights.size());
-        while (first < end && weights[first] == 0.0) ++first;
-        while (end > first && weights[end - 1] == 0.0) --end;
-        bands.push_back({first, std::vector<double>(weights.begin() + first,
-                                                   weights.begin() + end)});
+        int end = n_bins;
+        // Include both endpoints, then evaluate/trim with the original formula.
+        // Degenerate triangles keep the original full-bin arithmetic.
+        if (sr > 0 && left < center && center < right && std::isfinite(norm)
+            && std::isfinite(left) && std::isfinite(right)) {
+            first = static_cast<int>(std::lower_bound(frequencies.begin(), frequencies.end(), left)
+                                     - frequencies.begin());
+            end = static_cast<int>(std::upper_bound(frequencies.begin(), frequencies.end(), right)
+                                   - frequencies.begin());
+        }
+        std::vector<double> weights(end - first);
+        for (int k = first; k < end; ++k) {
+            const double rising = (frequencies[k] - left) / (center - left);
+            const double falling = (right - frequencies[k]) / (right - center);
+            weights[k - first] = std::max(0.0, std::min(rising, falling)) * norm;
+        }
+        std::size_t begin = 0;
+        std::size_t finish = weights.size();
+        while (begin < finish && weights[begin] == 0.0) ++begin;
+        while (finish > begin && weights[finish - 1] == 0.0) --finish;
+        if (begin == finish) {
+            bands.push_back({n_bins, {}});
+        } else {
+            if (begin != 0)
+                std::move(weights.begin() + begin, weights.begin() + finish, weights.begin());
+            weights.resize(finish - begin);
+            bands.push_back({first + static_cast<int>(begin), std::move(weights)});
+        }
     }
     return bands;
 }
@@ -501,10 +537,10 @@ void compute_melspectrogram(const std::vector<double>& y, int sr, int n_fft,
                                        y[start + 2 * i + 1] * window[2 * i + 1]};
                 }
                 fft_inplace(fft_data, fft_plan.packed_plan);
-    
+
                 compute_power(fft_data.data(), fft_plan, power.data(),
                               power_first, power_end);
-    
+
                 project_mel(mel_fb, power.data(), mel_block.data(), frame_block, lane);
             }
             for (int m = 0; m < n_mels; ++m)
