@@ -477,26 +477,40 @@ void compute_melspectrogram(const std::vector<double>& y, int sr, int n_fft,
     std::vector<std::vector<double>> power_buffers(
         workers, std::vector<double>(n_bins));
 
+    // Eight doubles form one 64-byte output segment per Mel band.
+    constexpr int frame_block = 8;
+    std::vector<std::vector<double>> mel_buffers(
+        workers, std::vector<double>(static_cast<std::size_t>(n_mels) * frame_block));
+
     const auto process_frames = [&](int worker) {
         auto& fft_data = fft_buffers[worker];
         auto& power = power_buffers[worker];
+        auto& mel_block = mel_buffers[worker];
         const int first = static_cast<long long>(n_frames) * worker / workers;
         const int end = static_cast<long long>(n_frames) * (worker + 1) / workers;
-        for (int t = first; t < end; ++t) {
-            const std::size_t start = static_cast<std::size_t>(t) * hop_length;
-            if (n_fft == 1) {
-                fft_data[0] = {y[start] * window[0], 0.0};
-            } else {
-                for (int i = 0; i < n_fft / 2; ++i)
-                    fft_data[i] = {y[start + 2 * i] * window[2 * i],
-                                   y[start + 2 * i + 1] * window[2 * i + 1]};
+        for (int block = first; block < end;) {
+            const int count = std::min(frame_block, end - block);
+            for (int lane = 0; lane < count; ++lane) {
+                const int t = block + lane;
+                const std::size_t start = static_cast<std::size_t>(t) * hop_length;
+                if (n_fft == 1) {
+                    fft_data[0] = {y[start] * window[0], 0.0};
+                } else {
+                    for (int i = 0; i < n_fft / 2; ++i)
+                        fft_data[i] = {y[start + 2 * i] * window[2 * i],
+                                       y[start + 2 * i + 1] * window[2 * i + 1]};
+                }
+                fft_inplace(fft_data, fft_plan.packed_plan);
+    
+                compute_power(fft_data.data(), fft_plan, power.data(),
+                              power_first, power_end);
+    
+                project_mel(mel_fb, power.data(), mel_block.data(), frame_block, lane);
             }
-            fft_inplace(fft_data, fft_plan.packed_plan);
-
-            compute_power(fft_data.data(), fft_plan, power.data(),
-                          power_first, power_end);
-
-            project_mel(mel_fb, power.data(), output.data(), n_frames, t);
+            for (int m = 0; m < n_mels; ++m)
+                std::copy_n(mel_block.data() + static_cast<std::size_t>(m) * frame_block,
+                            count, output.data() + static_cast<std::size_t>(m) * n_frames + block);
+            block += count;
         }
     };
 
