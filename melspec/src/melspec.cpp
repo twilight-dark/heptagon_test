@@ -464,6 +464,103 @@ void project_mel_avx2(const std::vector<MelBand>& bands, const double* power,
         output[m * n_frames + frame] = result;
     }
 }
+
+// Each vector lane carries one independent time frame.
+struct alignas(32) FrameBatchComplex {
+    double real[4];
+    double imag[4];
+};
+
+__attribute__((target("avx2")))
+void compute_four_frames(const double* samples, const double* window, int hop,
+                         const RealFftPlan& plan, const std::vector<MelBand>& bands,
+                         int power_first, int power_end, FrameBatchComplex* packed,
+                         double* power, double* output, std::size_t output_stride) {
+    const int n = plan.n;
+    const int half = n / 2;
+    const int packed_size = std::max(1, half);
+    if (n == 1) {
+        for (int lane = 0; lane < 4; ++lane) {
+            packed[0].real[lane] = samples[static_cast<std::size_t>(lane) * hop] * window[0];
+            packed[0].imag[lane] = 0.0;
+        }
+    } else {
+        for (int k = 0; k < half; ++k) {
+            for (int lane = 0; lane < 4; ++lane) {
+                const double* frame = samples + static_cast<std::size_t>(lane) * hop;
+                packed[k].real[lane] = frame[2 * k] * window[2 * k];
+                packed[k].imag[lane] = frame[2 * k + 1] * window[2 * k + 1];
+            }
+        }
+    }
+    for (const auto& indices : plan.packed_plan.swaps)
+        std::swap(packed[indices.first], packed[indices.second]);
+    for (int len = 2; len <= packed_size;) {
+        const int h = len / 2;
+        const auto* weights = plan.packed_plan.twiddles.data() + h - 1;
+        for (int i = 0; i < packed_size; i += len) {
+            for (int j = 0; j < h; ++j) {
+                auto& a = packed[i + j];
+                auto& b = packed[i + j + h];
+                const __m256d ar = _mm256_load_pd(a.real);
+                const __m256d ai = _mm256_load_pd(a.imag);
+                const __m256d br = _mm256_load_pd(b.real);
+                const __m256d bi = _mm256_load_pd(b.imag);
+                const __m256d wr = _mm256_set1_pd(weights[j].real());
+                const __m256d wi = _mm256_set1_pd(weights[j].imag());
+                const __m256d vr = _mm256_sub_pd(_mm256_mul_pd(br, wr), _mm256_mul_pd(bi, wi));
+                const __m256d vi = _mm256_add_pd(_mm256_mul_pd(br, wi), _mm256_mul_pd(bi, wr));
+                _mm256_store_pd(a.real, _mm256_add_pd(ar, vr));
+                _mm256_store_pd(a.imag, _mm256_add_pd(ai, vi));
+                _mm256_store_pd(b.real, _mm256_sub_pd(ar, vr));
+                _mm256_store_pd(b.imag, _mm256_sub_pd(ai, vi));
+            }
+        }
+        if (len == packed_size) break;
+        len *= 2;
+    }
+    if (power_first < power_end) {
+        const __m256d r0 = _mm256_load_pd(packed[0].real);
+        const __m256d i0 = _mm256_load_pd(packed[0].imag);
+        if (power_first == 0) {
+            const __m256d dc = n == 1 ? r0 : _mm256_add_pd(r0, i0);
+            _mm256_storeu_pd(power, _mm256_mul_pd(dc, dc));
+        }
+        if (n > 1 && power_end > half) {
+            const __m256d nyquist = _mm256_sub_pd(r0, i0);
+            _mm256_storeu_pd(power + static_cast<std::size_t>(half) * 4,
+                             _mm256_mul_pd(nyquist, nyquist));
+        }
+        const __m256d scale = _mm256_set1_pd(0.5);
+        const int end = std::min(power_end, half);
+        for (int k = std::max(1, power_first); k < end; ++k) {
+            const __m256d ar = _mm256_load_pd(packed[k].real);
+            const __m256d ai = _mm256_load_pd(packed[k].imag);
+            const __m256d br = _mm256_load_pd(packed[half - k].real);
+            const __m256d bi = _mm256_load_pd(packed[half - k].imag);
+            const __m256d wr = _mm256_set1_pd(plan.recovery[k].real());
+            const __m256d wi = _mm256_set1_pd(plan.recovery[k].imag());
+            const __m256d dr = _mm256_sub_pd(ar, br);
+            const __m256d di = _mm256_add_pd(ai, bi);
+            const __m256d rr = _mm256_sub_pd(_mm256_mul_pd(dr, wr), _mm256_mul_pd(di, wi));
+            const __m256d ri = _mm256_add_pd(_mm256_mul_pd(dr, wi), _mm256_mul_pd(di, wr));
+            const __m256d real = _mm256_mul_pd(scale, _mm256_add_pd(_mm256_add_pd(ar, br), ri));
+            const __m256d imag = _mm256_mul_pd(scale, _mm256_sub_pd(_mm256_sub_pd(ai, bi), rr));
+            _mm256_storeu_pd(power + static_cast<std::size_t>(k) * 4,
+                             _mm256_add_pd(_mm256_mul_pd(real, real), _mm256_mul_pd(imag, imag)));
+        }
+    }
+    for (std::size_t m = 0; m < bands.size(); ++m) {
+        const auto& band = bands[m];
+        __m256d sum = _mm256_setzero_pd();
+        for (std::size_t k = 0; k < band.weights.size(); ++k) {
+            const __m256d weight = _mm256_set1_pd(band.weights[k]);
+            const __m256d values = _mm256_loadu_pd(power + (band.first + k) * 4);
+            sum = _mm256_add_pd(sum, _mm256_mul_pd(weight, values));
+        }
+        _mm256_storeu_pd(output + m * output_stride, sum);
+    }
+}
 #endif
 }  // namespace
 
@@ -518,6 +615,14 @@ void compute_melspectrogram(const std::vector<double>& y, int sr, int n_fft,
     std::vector<std::vector<double>> mel_buffers(
         workers, std::vector<double>(static_cast<std::size_t>(n_mels) * frame_block));
 
+#if defined(__x86_64__) || defined(__i386__)
+    const bool batch_frames = fft_plan.packed_plan.vectorized && n_frames / workers >= 4;
+    std::vector<std::vector<FrameBatchComplex>> batch_fft_buffers(
+        workers, std::vector<FrameBatchComplex>(batch_frames ? std::max(1, n_fft / 2) : 0));
+    std::vector<std::vector<double>> batch_power_buffers(
+        workers, std::vector<double>(batch_frames ? static_cast<std::size_t>(n_bins) * 4 : 0));
+#endif
+
     const auto process_frames = [&](int worker) {
         auto& fft_data = fft_buffers[worker];
         auto& power = power_buffers[worker];
@@ -526,7 +631,18 @@ void compute_melspectrogram(const std::vector<double>& y, int sr, int n_fft,
         const int end = static_cast<long long>(n_frames) * (worker + 1) / workers;
         for (int block = first; block < end;) {
             const int count = std::min(frame_block, end - block);
-            for (int lane = 0; lane < count; ++lane) {
+            int lane = 0;
+#if defined(__x86_64__) || defined(__i386__)
+            if (batch_frames) {
+                for (; lane + 4 <= count; lane += 4)
+                    compute_four_frames(y.data() + static_cast<std::size_t>(block + lane) * hop_length,
+                                        window.data(), hop_length, fft_plan, mel_fb,
+                                        power_first, power_end, batch_fft_buffers[worker].data(),
+                                        batch_power_buffers[worker].data(), mel_block.data() + lane,
+                                        frame_block);
+            }
+#endif
+            for (; lane < count; ++lane) {
                 const int t = block + lane;
                 const std::size_t start = static_cast<std::size_t>(t) * hop_length;
                 if (n_fft == 1) {
