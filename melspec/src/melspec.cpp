@@ -240,22 +240,55 @@ void compute_power(const std::complex<double>* packed, const RealFftPlan& plan,
         power[half] = nyquist * nyquist;
     }
 
-    const int interior_end = std::min(end, half);
-    for (int k = std::max(first, 1); k < interior_end; ++k) {
+    const int begin = std::max(first, 1);
+    const int finish = std::min(end, half);
+    const auto single_range = [&](int begin, int finish) {
+        for (int k = begin; k < finish; ++k) {
+            const double ar = packed[k].real();
+            const double ai = packed[k].imag();
+            const double br = packed[half - k].real();
+            const double bi = packed[half - k].imag();
+            const double wr = plan.recovery[k].real();
+            const double wi = plan.recovery[k].imag();
+            // b is conjugated: a+b = (ar+br, ai-bi), a-b = (ar-br, ai+bi).
+            const double dr = ar - br;
+            const double di = ai + bi;
+            const double rotated_r = dr * wr - di * wi;
+            const double rotated_i = dr * wi + di * wr;
+            const double real = 0.5 * ((ar + br) + rotated_i);
+            const double imag = 0.5 * ((ai - bi) - rotated_r);
+            power[k] = real * real + imag * imag;
+        }
+    };
+    // Pair only bins whose two outputs are both used by Mel projection.
+    const int pair_begin = std::max(begin, half - finish + 1);
+    const int pair_end = std::min({finish, half - begin + 1, (half + 1) / 2});
+    if (pair_begin >= pair_end) {
+        single_range(begin, finish);
+        return;
+    }
+    single_range(begin, pair_begin);
+    single_range(pair_end, half - pair_end + 1);
+    single_range(half - pair_begin + 1, finish);
+    for (int k = pair_begin; k < pair_end; ++k) {
         const double ar = packed[k].real();
         const double ai = packed[k].imag();
         const double br = packed[half - k].real();
         const double bi = packed[half - k].imag();
         const double wr = plan.recovery[k].real();
         const double wi = plan.recovery[k].imag();
-        // b is conjugated: a+b = (ar+br, ai-bi), a-b = (ar-br, ai+bi).
+        const double sr = ar + br;
+        const double si = ai - bi;
         const double dr = ar - br;
         const double di = ai + bi;
-        const double rotated_r = dr * wr - di * wi;
-        const double rotated_i = dr * wi + di * wr;
-        const double real = 0.5 * ((ar + br) + rotated_i);
-        const double imag = 0.5 * ((ai - bi) - rotated_r);
-        power[k] = real * real + imag * imag;
+        const double rr = dr * wr - di * wi;
+        const double ri = dr * wi + di * wr;
+        const double real0 = 0.5 * (sr + ri);
+        const double imag0 = 0.5 * (si - rr);
+        const double real1 = 0.5 * (sr - ri);
+        const double imag1 = -0.5 * (si + rr);
+        power[k] = real0 * real0 + imag0 * imag0;
+        power[half - k] = real1 * real1 + imag1 * imag1;
     }
 }
 }  // namespace
