@@ -602,8 +602,18 @@ void compute_melspectrogram(const std::vector<double>& y, int sr, int n_fft,
 #endif
     output.resize(static_cast<std::size_t>(n_mels) * n_frames);
     const unsigned int available = std::max(1u, std::thread::hardware_concurrency());
-    const int workers = std::min({16, static_cast<int>(std::min(available, 16u)),
-                                  1 + (n_frames - 1) / 64});
+    int fft_stages = 0;
+    for (int length = n_fft / 2; length > 1; length /= 2) ++fft_stages;
+    double frame_work = n_fft + static_cast<double>(n_fft / 2) * (fft_stages + 1)
+                        + 8.0 * std::max(0, power_end - power_first);
+    for (const auto& band : mel_fb) frame_work += band.weights.size();
+    // Approximate work includes packing, FFT, recovery and sparse projection.
+    // Avoid creating a team for short transforms just because there are many frames.
+    constexpr double work_per_worker = 1024.0 * 1024.0;
+    const int useful_workers = static_cast<int>(std::min(16.0, std::max(1.0,
+        std::ceil(static_cast<double>(n_frames) * frame_work / work_per_worker))));
+    const int workers = std::min({useful_workers, n_frames,
+                                  static_cast<int>(std::min(available, 16u))});
     // Allocate all thread-private buffers before launching any worker.
     std::vector<std::vector<std::complex<double>>> fft_buffers(
         workers, std::vector<std::complex<double>>(std::max(1, n_fft / 2)));
