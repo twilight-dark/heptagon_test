@@ -100,6 +100,14 @@ void butterflies_scalar(std::complex<double>* a, int n, const FftPlan& plan) {
 
 #if defined(__x86_64__) || defined(__i386__)
 __attribute__((target("avx2")))
+inline __m256d multiply_complex_pair(__m256d b, __m256d w) {
+    const __m256d wr = _mm256_movedup_pd(w);
+    const __m256d wi = _mm256_permute_pd(w, 0xf);
+    const __m256d swapped = _mm256_permute_pd(b, 0x5);
+    return _mm256_addsub_pd(_mm256_mul_pd(b, wr), _mm256_mul_pd(swapped, wi));
+}
+
+__attribute__((target("avx2")))
 void butterflies_avx2(std::complex<double>* a, int n, const FftPlan& plan) {
     // std::complex<double> exposes interleaved real/imaginary double storage.
     auto* data = reinterpret_cast<double*>(a);
@@ -107,6 +115,39 @@ void butterflies_avx2(std::complex<double>* a, int n, const FftPlan& plan) {
         const int half = len / 2;
         const auto* weights = reinterpret_cast<const double*>(
             plan.twiddles.data() + half - 1);
+        // Fuse two stages: keep the first-stage results in registers instead
+        // of storing and loading the entire array between stages.
+        if (len <= n / 2) {
+            const auto* next_weights = reinterpret_cast<const double*>(
+                plan.twiddles.data() + len - 1);
+            for (int i = 0; i < n; i += 2 * len) {
+                for (int j = 0; j < half; j += 2) {
+                    double* p = data + 2 * (i + j);
+                    const __m256d w = _mm256_loadu_pd(weights + 2 * j);
+                    const __m256d a0 = _mm256_loadu_pd(p);
+                    const __m256d a1 = multiply_complex_pair(
+                        _mm256_loadu_pd(p + 2 * half), w);
+                    const __m256d a2 = _mm256_loadu_pd(p + 2 * len);
+                    const __m256d a3 = multiply_complex_pair(
+                        _mm256_loadu_pd(p + 2 * (len + half)), w);
+                    const __m256d u0 = _mm256_add_pd(a0, a1);
+                    const __m256d u1 = _mm256_sub_pd(a0, a1);
+                    const __m256d v0 = multiply_complex_pair(
+                        _mm256_add_pd(a2, a3),
+                        _mm256_loadu_pd(next_weights + 2 * j));
+                    const __m256d v1 = multiply_complex_pair(
+                        _mm256_sub_pd(a2, a3),
+                        _mm256_loadu_pd(next_weights + 2 * (j + half)));
+                    _mm256_storeu_pd(p, _mm256_add_pd(u0, v0));
+                    _mm256_storeu_pd(p + 2 * half, _mm256_add_pd(u1, v1));
+                    _mm256_storeu_pd(p + 2 * len, _mm256_sub_pd(u0, v0));
+                    _mm256_storeu_pd(p + 2 * (len + half), _mm256_sub_pd(u1, v1));
+                }
+            }
+            if (len == n / 2) break;
+            len *= 4;
+            continue;
+        }
         for (int i = 0; i < n; i += len) {
             for (int j = 0; j < half; j += 2) {
                 const __m256d u = _mm256_loadu_pd(data + 2 * (i + j));
