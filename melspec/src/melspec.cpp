@@ -254,26 +254,44 @@ std::vector<MelBand> sparse_filterbank(int sr, int n_fft, int n_mels,
     }
     return bands;
 }
-double dot_scalar(const double* weights, const double* power, std::size_t count) {
-    double sum = 0.0;
-    for (std::size_t k = 0; k < count; ++k) sum += weights[k] * power[k];
-    return sum;
+// Dispatch once per frame, keeping all band dot products inside this function.
+void project_mel_scalar(const std::vector<MelBand>& bands, const double* power,
+                        double* output, std::size_t n_frames, std::size_t frame) {
+    for (std::size_t m = 0; m < bands.size(); ++m) {
+        const auto& band = bands[m];
+        const double* values = power + band.first;
+        double sum = 0.0;
+        for (std::size_t k = 0; k < band.weights.size(); ++k)
+            sum += band.weights[k] * values[k];
+        output[m * n_frames + frame] = sum;
+    }
 }
 
 #if defined(__x86_64__) || defined(__i386__)
 __attribute__((target("avx2")))
-double dot_avx2(const double* weights, const double* power, std::size_t count) {
-    __m256d sum = _mm256_setzero_pd();
-    std::size_t k = 0;
-    for (; k + 4 <= count; k += 4) {
-        sum = _mm256_add_pd(sum, _mm256_mul_pd(_mm256_loadu_pd(weights + k),
-                                              _mm256_loadu_pd(power + k)));
+void project_mel_avx2(const std::vector<MelBand>& bands, const double* power,
+                      double* output, std::size_t n_frames, std::size_t frame) {
+    for (std::size_t m = 0; m < bands.size(); ++m) {
+        const auto& band = bands[m];
+        const double* weights = band.weights.data();
+        const double* values = power + band.first;
+        const std::size_t count = band.weights.size();
+        double result = 0.0;
+        std::size_t k = 0;
+        // Fewer than four doubles cannot fill one AVX2 vector; skip its reduction.
+        if (count >= 4) {
+            __m256d sum = _mm256_setzero_pd();
+            for (; k + 4 <= count; k += 4) {
+                sum = _mm256_add_pd(sum, _mm256_mul_pd(_mm256_loadu_pd(weights + k),
+                                                      _mm256_loadu_pd(values + k)));
+            }
+            const __m128d pair = _mm_add_pd(_mm256_castpd256_pd128(sum),
+                                           _mm256_extractf128_pd(sum, 1));
+            result = _mm_cvtsd_f64(_mm_add_sd(pair, _mm_unpackhi_pd(pair, pair)));
+        }
+        for (; k < count; ++k) result += weights[k] * values[k];
+        output[m * n_frames + frame] = result;
     }
-    const __m128d pair = _mm_add_pd(_mm256_castpd256_pd128(sum),
-                                   _mm256_extractf128_pd(sum, 1));
-    double result = _mm_cvtsd_f64(_mm_add_sd(pair, _mm_unpackhi_pd(pair, pair)));
-    for (; k < count; ++k) result += weights[k] * power[k];
-    return result;
 }
 #endif
 }  // namespace
@@ -300,9 +318,9 @@ void compute_melspectrogram(const std::vector<double>& y, int sr, int n_fft,
 
     const auto mel_fb = sparse_filterbank(sr, n_fft, n_mels, f_min, f_max);
     const RealFftPlan fft_plan(n_fft);
-    auto dot = &dot_scalar;
+    auto project_mel = &project_mel_scalar;
 #if defined(__x86_64__) || defined(__i386__)
-    if (fft_plan.packed_plan.vectorized) dot = &dot_avx2;
+    if (fft_plan.packed_plan.vectorized) project_mel = &project_mel_avx2;
 #endif
     output.resize(static_cast<std::size_t>(n_mels) * n_frames);
     const unsigned int available = std::max(1u, std::thread::hardware_concurrency());
@@ -335,12 +353,7 @@ void compute_melspectrogram(const std::vector<double>& y, int sr, int n_fft,
                 power[k] = value.real() * value.real() + value.imag() * value.imag();
             }
 
-            for (int m = 0; m < n_mels; ++m) {
-                const auto& band = mel_fb[m];
-                const double acc = dot(band.weights.data(), power.data() + band.first,
-                                       band.weights.size());
-                output[static_cast<std::size_t>(m) * n_frames + t] = acc;
-            }
+            project_mel(mel_fb, power.data(), output.data(), n_frames, t);
         }
     };
 
