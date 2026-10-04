@@ -172,6 +172,40 @@ std::complex<double> real_bin(const std::vector<std::complex<double>>& packed,
     return {0.5 * (sum.real() + difference.imag()),
             0.5 * (sum.imag() - difference.real())};
 }
+
+// Separate endpoint handling from the uniform recovery/power loop so the
+// compiler can vectorize interior bins without per-bin special cases.
+void compute_power(const std::complex<double>* packed, const RealFftPlan& plan,
+                   double* power) {
+    if (plan.n == 1) {
+        const double value = packed[0].real();
+        power[0] = value * value;
+        return;
+    }
+
+    const int half = plan.n / 2;
+    const double dc = packed[0].real() + packed[0].imag();
+    const double nyquist = packed[0].real() - packed[0].imag();
+    power[0] = dc * dc;
+    power[half] = nyquist * nyquist;
+
+    for (int k = 1; k < half; ++k) {
+        const double ar = packed[k].real();
+        const double ai = packed[k].imag();
+        const double br = packed[half - k].real();
+        const double bi = packed[half - k].imag();
+        const double wr = plan.recovery[k].real();
+        const double wi = plan.recovery[k].imag();
+        // b is conjugated: a+b = (ar+br, ai-bi), a-b = (ar-br, ai+bi).
+        const double dr = ar - br;
+        const double di = ai + bi;
+        const double rotated_r = dr * wr - di * wi;
+        const double rotated_i = dr * wi + di * wr;
+        const double real = 0.5 * ((ar + br) + rotated_i);
+        const double imag = 0.5 * ((ai - bi) - rotated_r);
+        power[k] = real * real + imag * imag;
+    }
+}
 }  // namespace
 
 // Pack even/odd real samples into a half-length complex FFT.
@@ -348,10 +382,7 @@ void compute_melspectrogram(const std::vector<double>& y, int sr, int n_fft,
             }
             fft_inplace(fft_data, fft_plan.packed_plan);
 
-            for (int k = 0; k < n_bins; ++k) {
-                const auto value = real_bin(fft_data, fft_plan, k);
-                power[k] = value.real() * value.real() + value.imag() * value.imag();
-            }
+            compute_power(fft_data.data(), fft_plan, power.data());
 
             project_mel(mel_fb, power.data(), output.data(), n_frames, t);
         }
