@@ -363,6 +363,22 @@ void project_mel_avx2(const std::vector<MelBand>& bands, const double* power,
         // Fewer than four doubles cannot fill one AVX2 vector; skip its reduction.
         if (count >= 4) {
             __m256d sum = _mm256_setzero_pd();
+            if (count >= 16) {
+                __m256d sum1 = _mm256_setzero_pd();
+                __m256d sum2 = _mm256_setzero_pd();
+                __m256d sum3 = _mm256_setzero_pd();
+                for (; k + 16 <= count; k += 16) {
+                    sum = _mm256_add_pd(sum, _mm256_mul_pd(
+                        _mm256_loadu_pd(weights + k), _mm256_loadu_pd(values + k)));
+                    sum1 = _mm256_add_pd(sum1, _mm256_mul_pd(
+                        _mm256_loadu_pd(weights + k + 4), _mm256_loadu_pd(values + k + 4)));
+                    sum2 = _mm256_add_pd(sum2, _mm256_mul_pd(
+                        _mm256_loadu_pd(weights + k + 8), _mm256_loadu_pd(values + k + 8)));
+                    sum3 = _mm256_add_pd(sum3, _mm256_mul_pd(
+                        _mm256_loadu_pd(weights + k + 12), _mm256_loadu_pd(values + k + 12)));
+                }
+                sum = _mm256_add_pd(_mm256_add_pd(sum, sum1), _mm256_add_pd(sum2, sum3));
+            }
             for (; k + 4 <= count; k += 4) {
                 sum = _mm256_add_pd(sum, _mm256_mul_pd(_mm256_loadu_pd(weights + k),
                                                       _mm256_loadu_pd(values + k)));
