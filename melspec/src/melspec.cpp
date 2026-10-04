@@ -176,7 +176,9 @@ std::complex<double> real_bin(const std::vector<std::complex<double>>& packed,
 // Separate endpoint handling from the uniform recovery/power loop so the
 // compiler can vectorize interior bins without per-bin special cases.
 void compute_power(const std::complex<double>* packed, const RealFftPlan& plan,
-                   double* power) {
+                   double* power, int first, int end) {
+    // Only [first, end) is consumed by the sparse Mel projection.
+    if (first >= end) return;
     if (plan.n == 1) {
         const double value = packed[0].real();
         power[0] = value * value;
@@ -184,12 +186,17 @@ void compute_power(const std::complex<double>* packed, const RealFftPlan& plan,
     }
 
     const int half = plan.n / 2;
-    const double dc = packed[0].real() + packed[0].imag();
-    const double nyquist = packed[0].real() - packed[0].imag();
-    power[0] = dc * dc;
-    power[half] = nyquist * nyquist;
+    if (first == 0) {
+        const double dc = packed[0].real() + packed[0].imag();
+        power[0] = dc * dc;
+    }
+    if (end > half) {
+        const double nyquist = packed[0].real() - packed[0].imag();
+        power[half] = nyquist * nyquist;
+    }
 
-    for (int k = 1; k < half; ++k) {
+    const int interior_end = std::min(end, half);
+    for (int k = std::max(first, 1); k < interior_end; ++k) {
         const double ar = packed[k].real();
         const double ai = packed[k].imag();
         const double br = packed[half - k].real();
@@ -351,6 +358,16 @@ void compute_melspectrogram(const std::vector<double>& y, int sr, int n_fft,
             0.5 * (1.0 - std::cos(2.0 * M_PI * i / static_cast<double>(n_fft)));
 
     const auto mel_fb = sparse_filterbank(sr, n_fft, n_mels, f_min, f_max);
+    // Cover every nonempty band; bins outside this range are never read.
+    // Keep the complete packed FFT for the conjugate pairs used in recovery.
+    int power_first = n_bins;
+    int power_end = 0;
+    for (const auto& band : mel_fb) {
+        if (band.weights.empty()) continue;
+        power_first = std::min(power_first, band.first);
+        power_end = std::max(power_end,
+                             band.first + static_cast<int>(band.weights.size()));
+    }
     const RealFftPlan fft_plan(n_fft);
     auto project_mel = &project_mel_scalar;
 #if defined(__x86_64__) || defined(__i386__)
@@ -382,7 +399,8 @@ void compute_melspectrogram(const std::vector<double>& y, int sr, int n_fft,
             }
             fft_inplace(fft_data, fft_plan.packed_plan);
 
-            compute_power(fft_data.data(), fft_plan, power.data());
+            compute_power(fft_data.data(), fft_plan, power.data(),
+                          power_first, power_end);
 
             project_mel(mel_fb, power.data(), output.data(), n_frames, t);
         }
