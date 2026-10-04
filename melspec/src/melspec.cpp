@@ -7,6 +7,7 @@
 #include <cstring>
 #include <stdexcept>
 #include <thread>
+#include <utility>
 #include <vector>
 
 #if defined(__x86_64__) || defined(__i386__)
@@ -33,6 +34,7 @@ namespace {
 struct FftPlan {
     bool vectorized = false;
     std::vector<int> reverse;
+    std::vector<std::pair<int, int>> swaps;
     std::vector<std::complex<double>> twiddles;
 
     explicit FftPlan(int n) {
@@ -44,6 +46,8 @@ struct FftPlan {
         reverse.resize(n);
         for (int i = 1; i < n; ++i)
             reverse[i] = (reverse[i >> 1] >> 1) | ((i & 1) ? n >> 1 : 0);
+        for (int i = 1; i < n; ++i)
+            if (i < reverse[i]) swaps.emplace_back(i, reverse[i]);
         twiddles.resize(n - 1);
         for (int len = 2; len <= n;) {
             const int half = len / 2;
@@ -170,8 +174,8 @@ void butterflies_avx2(std::complex<double>* a, int n, const FftPlan& plan) {
 
 void fft_inplace(std::vector<std::complex<double>>& a, const FftPlan& plan) {
     const int n = static_cast<int>(a.size());
-    for (int i = 0; i < n; ++i)
-        if (i < plan.reverse[i]) std::swap(a[i], a[plan.reverse[i]]);
+    for (const auto& indices : plan.swaps)
+        std::swap(a[indices.first], a[indices.second]);
     first_stages(a.data(), n);
 #if defined(__x86_64__) || defined(__i386__)
     if (plan.vectorized) {
