@@ -5,6 +5,8 @@
 namespace {
 constexpr int kTile = 32;
 constexpr int kBlockRows = 16;
+constexpr int kValuesPerThread = kTile / kBlockRows;
+static_assert(kTile % kBlockRows == 0, "Block rows must divide the tile size");
 
 __global__ void transpose_and_mix(int N, const double *__restrict__ A,
                                   double *__restrict__ B) {
@@ -24,18 +26,30 @@ __global__ void transpose_and_mix(int N, const double *__restrict__ A,
 
     const std::size_t output_row = blockIdx.x * kTile;
     const std::size_t output_col = blockIdx.y * kTile + lane;
+    // Keep independent output groups live together to expose instruction-level
+    // parallelism across their otherwise dependent eight-round chains.
+    double values[kValuesPerThread];
 #pragma unroll
-    for (int r = row; r < kTile; r += kBlockRows) {
-        // After transposition a warp owns one complete 32-element group.
-        double value = tile[lane][r];
+    for (int group = 0; group < kValuesPerThread; ++group) {
+        values[group] = tile[lane][row + group * kBlockRows];
+    }
 #pragma unroll
-        for (int round = 0; round < 8; ++round) {
-            // Exchange old values before updating, including lane 31 -> 0.
-            const double next = __shfl_sync(0xffffffffu, value,
-                                            (lane + 1) & 31);
-            value += next;
+    for (int round = 0; round < 8; ++round) {
+        double next[kValuesPerThread];
+#pragma unroll
+        for (int group = 0; group < kValuesPerThread; ++group) {
+            // Each group still exchanges only its own previous-round values.
+            next[group] = __shfl_sync(0xffffffffu, values[group], (lane + 1) & 31);
         }
-        B[(output_row + r) * stride + output_col] = value;
+#pragma unroll
+        for (int group = 0; group < kValuesPerThread; ++group) {
+            values[group] += next[group];
+        }
+    }
+#pragma unroll
+    for (int group = 0; group < kValuesPerThread; ++group) {
+        const int r = row + group * kBlockRows;
+        B[(output_row + r) * stride + output_col] = values[group];
     }
 }
 }  // namespace
