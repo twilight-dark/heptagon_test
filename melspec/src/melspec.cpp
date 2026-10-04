@@ -10,10 +10,6 @@
 #include <utility>
 #include <vector>
 
-#if defined(_OPENMP)
-#include <omp.h>
-#endif
-
 #if defined(__x86_64__) || defined(__i386__)
 #include <immintrin.h>
 #endif
@@ -681,20 +677,6 @@ void compute_melspectrogram(const std::vector<double>& y, int sr, int n_fft,
         }
     };
 
-#if defined(_OPENMP)
-    if (workers == 1) {
-        process_frames(0);
-    } else {
-#pragma omp parallel num_threads(workers)
-        {
-            // Dynamic/nested teams can contain fewer threads than requested.
-            // Cover all static frame partitions even in that case.
-            const int team_size = omp_get_num_threads();
-            for (int worker = omp_get_thread_num(); worker < workers; worker += team_size)
-                process_frames(worker);
-        }
-    }
-#else
     std::vector<std::thread> threads;
     threads.reserve(workers - 1);
     try {
@@ -706,5 +688,4 @@ void compute_melspectrogram(const std::vector<double>& y, int sr, int n_fft,
     }
     process_frames(0);
     for (auto& thread : threads) thread.join();
-#endif
 }
