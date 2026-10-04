@@ -136,12 +136,12 @@ void butterflies_avx2(std::complex<double>* a, int n, const FftPlan& plan) {
                         _mm256_loadu_pd(p + 2 * (len + half)), w);
                     const __m256d u0 = _mm256_add_pd(a0, a1);
                     const __m256d u1 = _mm256_sub_pd(a0, a1);
-                    const __m256d v0 = multiply_complex_pair(
-                        _mm256_add_pd(a2, a3),
-                        _mm256_loadu_pd(next_weights + 2 * j));
-                    const __m256d v1 = multiply_complex_pair(
-                        _mm256_sub_pd(a2, a3),
-                        _mm256_loadu_pd(next_weights + 2 * (j + half)));
+                    const __m256d next_w = _mm256_loadu_pd(next_weights + 2 * j);
+                    const __m256d v0 = multiply_complex_pair(_mm256_add_pd(a2, a3), next_w);
+                    const __m256d rotated = multiply_complex_pair(_mm256_sub_pd(a2, a3), next_w);
+                    // W[j + half] = -i * W[j] in the second fused stage.
+                    const __m256d v1 = _mm256_xor_pd(_mm256_permute_pd(rotated, 0x5),
+                                                    _mm256_set_pd(-0.0, 0.0, -0.0, 0.0));
                     _mm256_storeu_pd(p, _mm256_add_pd(u0, v0));
                     _mm256_storeu_pd(p + 2 * half, _mm256_add_pd(u1, v1));
                     _mm256_storeu_pd(p + 2 * len, _mm256_sub_pd(u0, v0));
